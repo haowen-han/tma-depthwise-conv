@@ -1,14 +1,13 @@
 import os
-from setuptools import setup, find_packages
+from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-# CUTLASS include path. The plan expects cutlass to live alongside this project:
-#   /ssd1/hanhaowen/cutlass   (sibling of /ssd1/hanhaowen/tma-depthwise-conv)
-# You can override it with the CUTLASS_DIR environment variable.
+# CUTLASS include path. By default we use the vendored submodule under
+# third_party/cutlass; override with the CUTLASS_DIR environment variable.
 HERE = os.path.dirname(os.path.abspath(__file__))
 CUTLASS_DIR = os.environ.get(
     "CUTLASS_DIR",
-    os.path.normpath(os.path.join(HERE, "..", "cutlass")),
+    os.path.join(HERE, "third_party", "cutlass"),
 )
 
 cutlass_includes = [
@@ -19,15 +18,14 @@ cutlass_includes = [
 setup(
     name="tma_dwconv",
     version="0.0.1",
-    packages=find_packages(exclude=["tests", "bench"]),
+    py_modules=["tma_dwconv"],
     ext_modules=[
         CUDAExtension(
-            name="tma_dwconv._C",
+            name="_tma_dwconv_C",
             sources=[
                 "csrc/bindings.cpp",
                 "csrc/kernel_v0_naive_float4.cu",
-                "csrc/kernel_v1_tma_ws_db.cu",
-                "csrc/kernel_v2_tma_ws_ms.cu",
+                "csrc/kernel_tma_ws.cu",
             ],
             include_dirs=cutlass_includes,
             libraries=["cuda"],  # driver API: cuTensorMapEncodeTiled

@@ -35,10 +35,9 @@ struct ConvParams {
     int N, H, W, C;
     int P, Q;
     int pad_h, pad_w;
-    // stride/dilation fixed to 1 in the first version, kept here to make it
+    // stride fixed to 1 in the first version, kept here to make it
     // easy to extend later.
     int stride_h, stride_w;
-    int dilation_h, dilation_w;
 };
 
 } // namespace tma_dwconv

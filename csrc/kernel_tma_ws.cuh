@@ -1,5 +1,5 @@
 // Shared template for v1 / v2 warp-specialized, multi-stage TMA depthwise-
-// conv kernels.
+// conv kernels, using CuTe instead of raw PTX.
 //
 // Both v1 (N_STAGE=2, "double buffer") and v2 (N_STAGE=4, "multi-stage")
 // instantiate the same kernel; only N_STAGE differs.
@@ -7,14 +7,15 @@
 // Architecture
 //   grid  = (P_tiles, C_blocks, N)
 //   block = WARPS_PER_CTA * 32 threads
-//     warp 0                      -> producer  (issues TMA loads)
+//     warp 0                      -> producer  (issues TMA loads via cute::copy)
 //     warps 1 .. WARPS_PER_CTA-1  -> consumers (depthwise FMA)
 //
-// One CTA iterates along Q, loading one (kHaloP x kHaloQ x kBlockC) input
-// tile per step into an N_STAGE ring of smem buffers via TMA. A pair of
-// mbarriers (full/empty) per stage synchronizes the producer/consumer.
-//
-// The filter F[R, S, C] slice for the CTA's c_block is loaded once into smem.
+// The TMA descriptor is constructed on the host via cute::make_tma_atom
+// against a 4D NHWC view of X (mode order in CuTe: (C, W, H, N),
+// innermost = C).  The producer warp issues loads through the CuTe wrapper
+// cute::SM90_TMA_LOAD_4D::copy, passing (C, W, H, N) coords directly — no
+// coord-tensor / tma_partition machinery on the device side.  Barriers use
+// cute::{initialize,wait,arrive}_barrier and cute::set_barrier_transaction_bytes.
 
 #pragma once
 
@@ -22,69 +23,33 @@
 
 #include <cuda_fp16.h>
 #include <cstdint>
-#include <cuda.h>         // CUtensorMap, cuTensorMapEncodeTiled
+
+#include <cute/tensor.hpp>
+#include <cute/atom/copy_atom.hpp>
+#include <cute/atom/copy_traits_sm90_tma.hpp>
+#include <cute/arch/copy_sm90_tma.hpp>
+#include <cute/arch/copy_sm90_desc.hpp>  // cute::{initialize,wait,arrive}_barrier
+#include <cutlass/half.h>                // cutlass::half_t (TMA descriptor dtype)
 
 namespace tma_dwconv {
 
-// ---------------------------- PTX helpers ----------------------------------
-// These wrap the subset of mbarrier / TMA PTX we need.  Each helper takes a
-// *shared-memory* pointer (already cvta'd to .shared::cta).
+using namespace cute;
 
-__device__ __forceinline__ uint32_t smem_ptr_u32(const void* ptr) {
-    return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
-}
+// ---------------- CuTe layouts (shared by host/device) ---------------------
 
-__device__ __forceinline__ void mbar_init(uint64_t* bar, uint32_t count) {
-    uint32_t addr = smem_ptr_u32(bar);
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(addr), "r"(count));
-}
-
-__device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
-    uint32_t addr = smem_ptr_u32(bar);
-    asm volatile("{ .reg .b64 t; mbarrier.arrive.shared::cta.b64 t, [%0]; }\n" :: "r"(addr));
-}
-
-__device__ __forceinline__ void mbar_expect_tx(uint64_t* bar, uint32_t tx_count) {
-    uint32_t addr = smem_ptr_u32(bar);
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
-                 :: "r"(addr), "r"(tx_count));
-}
-
-__device__ __forceinline__ void mbar_wait_parity(uint64_t* bar, uint32_t phase) {
-    uint32_t addr = smem_ptr_u32(bar);
-    asm volatile(
-        "{\n"
-        ".reg .pred P;\n"
-        "LAB_WAIT: mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n"
-        "@P bra DONE;\n"
-        "bra LAB_WAIT;\n"
-        "DONE:\n"
-        "}\n"
-        :: "r"(addr), "r"(phase));
-}
-
-__device__ __forceinline__ void fence_proxy_async_shared_cta() {
-    asm volatile("fence.proxy.async.shared::cta;");
-}
-
-// 4D TMA load (global -> smem) with mbarrier::complete_tx.
-__device__ __forceinline__ void tma_load_4d(
-    void*             smem_dst,
-    const CUtensorMap* tmap,
-    int32_t c0, int32_t c1, int32_t c2, int32_t c3,
-    uint64_t*         bar)
-{
-    uint32_t smem_addr = smem_ptr_u32(smem_dst);
-    uint32_t bar_addr  = smem_ptr_u32(bar);
-    asm volatile(
-        "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%3, %4, %5, %6}], [%2];\n"
-        :
-        : "r"(smem_addr),
-          "l"(reinterpret_cast<uint64_t>(tmap)),
-          "r"(bar_addr),
-          "r"(c0), "r"(c1), "r"(c2), "r"(c3)
-        : "memory");
+// SMEM tile layout for one stage: (BlockC, HaloQ, HaloP), innermost = C.
+// Compact linear, no swizzle -> matches the index arithmetic in the
+// consumer compute loop (offset = (p*kHaloQ + q)*kBlockC + c).
+//
+// NOTE on mode order: CuTe / TMA convention is fastest-first (mode 0 = the
+// contiguous, stride-1 dim).  This is the OPPOSITE of the C++/NumPy "NHWC"
+// reading order.  make_tma_atom asserts `stride<0>(gmem) == 1`, so we must
+// write it as (C, W, H, N) even though the tensor is stored as NHWC.
+CUTE_HOST_DEVICE constexpr auto make_smem_x_layout() {
+    return make_layout(
+        make_shape (Int<kBlockC>{}, Int<kHaloQ>{}, Int<kHaloP>{}),
+        make_stride(Int<1>{},       Int<kBlockC>{},
+                    Int<kBlockC * kHaloQ>{}));
 }
 
 // ---------------------------- shared-mem layout ----------------------------
@@ -97,9 +62,9 @@ struct SmemLayout {
 };
 
 // ----------------------------- device kernel -------------------------------
-template <int N_STAGE, int WARPS_PER_CTA>
+template <class TmaAtomX, int N_STAGE, int WARPS_PER_CTA>
 __global__ void dwconv_tma_ws_kernel(
-    const __grid_constant__ CUtensorMap tmap_x,
+    CUTE_GRID_CONSTANT TmaAtomX const tma_atom_x,
     const __half* __restrict__ F,
     __half*       __restrict__ Y,
     ConvParams    params)
@@ -127,20 +92,15 @@ __global__ void dwconv_tma_ws_kernel(
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int i = 0; i < N_STAGE; ++i) {
-            // full_bar: 1 arrival (TMA completion signals via
-            //           mbarrier.complete_tx; we call expect_tx each round).
-            mbar_init(&smem.full_bar[i], 1);
-            // empty_bar: every consumer thread arrives once.
-            mbar_init(&smem.empty_bar[i], CONSUMER_THREADS);
+            cute::initialize_barrier(smem.full_bar[i],  /*arrive_count=*/1);
+            cute::initialize_barrier(smem.empty_bar[i],
+                                     /*arrive_count=*/CONSUMER_THREADS);
         }
-        fence_proxy_async_shared_cta();
     }
     __syncthreads();
 
     // ---- Load filter slice (producer lane 0) ----
     if (warp_id == 0 && lane_id == 0) {
-        // F[R, S, C], c_base selects a contiguous 64-channel strip.
-        // Small (1152 B) so a vectorized scalar copy is fine.
         const float4* g = reinterpret_cast<const float4*>(&F[c_base]);
         float4*       s = reinterpret_cast<float4*>(smem.f_tile);
         const int f_stride_vec = params.C / kVec;
@@ -156,58 +116,63 @@ __global__ void dwconv_tma_ws_kernel(
 
     // ---- Warp-specialized main loop ----
     if (warp_id == 0) {
-        // Producer warp: lane 0 issues TMA loads, other lanes are idle.
         if (lane_id == 0) {
+            // Skip the coord-tensor / tma_partition machinery: call the CuTe
+            // PTX wrapper directly.  Coords are in TMA-descriptor order
+            // (C, W, H, N), matching the layout passed to make_tma_atom_x.
+            // Negative W/H coords at image borders are handled by the TMA OOB
+            // policy (zero fill).
+            cute::TmaDescriptor const* tma_desc =
+                tma_atom_x.get_tma_descriptor();
+            constexpr uint64_t kCacheHint =
+                static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL);
+
+            const int32_t c_crd = c_base;
+            const int32_t h_crd = p_base - int(params.pad_h);
+            const int32_t n_crd = n_idx;
+
             for (int tile = 0; tile < num_q_tiles; ++tile) {
-                const int s     = tile % N_STAGE;
+                const int s_idx = tile % N_STAGE;
                 const int round = tile / N_STAGE;
-                // Wait for consumer to finish previous use of this stage.
+
                 if (round > 0) {
                     const uint32_t empty_phase = (round - 1) & 1u;
-                    mbar_wait_parity(&smem.empty_bar[s], empty_phase);
+                    cute::wait_barrier(smem.empty_bar[s_idx], empty_phase);
                 }
-                // Prepare barrier for TMA and issue load.
-                mbar_expect_tx(&smem.full_bar[s], kInputTileBytes);
-                // 4D NHWC TMA coords (innermost first: C, W, H, N).
-                const int q_base = tile * kBlockQ;
-                const int32_t c0 = c_base;                           // C
-                const int32_t c1 = q_base - params.pad_w;            // W start
-                const int32_t c2 = p_base - params.pad_h;            // H start
-                const int32_t c3 = n_idx;                            // N
-                tma_load_4d(&smem.x_tiles[s][0], &tmap_x,
-                            c0, c1, c2, c3, &smem.full_bar[s]);
+
+                cute::set_barrier_transaction_bytes(
+                    smem.full_bar[s_idx], kInputTileBytes);
+
+                const int32_t w_crd = tile * kBlockQ - int(params.pad_w);
+                cute::SM90_TMA_LOAD_4D::copy(
+                    tma_desc,
+                    &smem.full_bar[s_idx],
+                    kCacheHint,
+                    &smem.x_tiles[s_idx][0],
+                    c_crd, w_crd, h_crd, n_crd);
             }
         }
     } else {
-        // Consumer warps
+        // ---- Consumer warps: depthwise FMA over smem tile ----
         const int consumer_tid = threadIdx.x - 32;  // 0..CONSUMER_THREADS-1
-
-        // Each consumer thread owns a set of (p, q, c-vec) outputs inside
-        // the tile.  Linearize: total vec-slots = BlockP * BlockQ * BlockC/Vec
-        // = 8 * 32 * 8 = 2048.  With 128/96/... consumer threads, each one
-        // strides through the work list.
         constexpr int kOutVecsPerTile =
             kBlockP * kBlockQ * (kBlockC / kVec);  // 2048
 
-        // For each q_tile, consume and compute
         for (int tile = 0; tile < num_q_tiles; ++tile) {
-            const int s     = tile % N_STAGE;
+            const int s_idx = tile % N_STAGE;
             const int round = tile / N_STAGE;
             const uint32_t full_phase = round & 1u;
-            mbar_wait_parity(&smem.full_bar[s], full_phase);
+            cute::wait_barrier(smem.full_bar[s_idx], full_phase);
 
             const int q_base = tile * kBlockQ;
 
-            // Compute outputs for this tile.
             for (int idx = consumer_tid; idx < kOutVecsPerTile;
                  idx += CONSUMER_THREADS) {
-                // idx = ((p * kBlockQ) + q) * (kBlockC/kVec) + cv
-                const int cv = idx % (kBlockC / kVec);
-                const int tmp = idx / (kBlockC / kVec);
+                const int cv      = idx % (kBlockC / kVec);
+                const int tmp     = idx / (kBlockC / kVec);
                 const int q_local = tmp % kBlockQ;
                 const int p_local = tmp / kBlockQ;
-
-                const int c_local = cv * kVec;  // 0..BlockC step VEC
+                const int c_local = cv * kVec;
 
                 const int p_glb = p_base + p_local;
                 const int q_glb = q_base + q_local;
@@ -221,11 +186,10 @@ __global__ void dwconv_tma_ws_kernel(
                 for (int r = 0; r < kR; ++r) {
                     #pragma unroll
                     for (int ss = 0; ss < kS; ++ss) {
-                        // smem.x_tiles layout: [kHaloP, kHaloQ, kBlockC]
                         const int ph = p_local + r;
                         const int qh = q_local + ss;
                         const __half* xp =
-                            &smem.x_tiles[s][(ph * kHaloQ + qh) * kBlockC + c_local];
+                            &smem.x_tiles[s_idx][(ph * kHaloQ + qh) * kBlockC + c_local];
                         const __half* wp =
                             &smem.f_tile[(r * kS + ss) * kBlockC + c_local];
                         float4 xv = *reinterpret_cast<const float4*>(xp);
@@ -240,7 +204,6 @@ __global__ void dwconv_tma_ws_kernel(
                     }
                 }
 
-                // Store fp16
                 __half yh[kVec];
                 #pragma unroll
                 for (int v = 0; v < kVec; ++v) yh[v] = __float2half(acc[v]);
@@ -252,47 +215,39 @@ __global__ void dwconv_tma_ws_kernel(
             }
 
             // Signal this stage's buffer is free.
-            mbar_arrive(&smem.empty_bar[s]);
+            cute::arrive_barrier(smem.empty_bar[s_idx]);
         }
     }
 }
 
-// ------------------ Host helper : build TMA descriptor for X ----------------
-inline CUresult build_tmap_x_f16(
-    CUtensorMap& tmap,
-    const void*  gmem_ptr,
-    const ConvParams& p)
-{
-    // X is [N, H, W, C] fp16 row-major, innermost dim = C.
-    // TMA descriptor sizes are listed innermost-first.
-    cuuint64_t size[4]    = { (cuuint64_t)p.C, (cuuint64_t)p.W,
-                              (cuuint64_t)p.H, (cuuint64_t)p.N };
-    cuuint64_t stride[3]  = {
-        (cuuint64_t)p.C * sizeof(__half),                              // stride of W
-        (cuuint64_t)p.C * p.W * sizeof(__half),                        // stride of H
-        (cuuint64_t)p.C * p.W * p.H * sizeof(__half),                  // stride of N
-    };
-    cuuint32_t box[4]     = { (cuuint32_t)kBlockC, (cuuint32_t)kHaloQ,
-                              (cuuint32_t)kHaloP, 1u };
-    cuuint32_t elem_stride[4] = { 1u, 1u, 1u, 1u };
+// -------------------- Host helper : build TMA atom for X -------------------
+// Builds cute::Copy_Atom<SM90_TMA_LOAD, cutlass::half_t> over a 4D view of X.
+//
+// CuTe mode order is fastest-first (opposite of C++/NumPy): the contiguous
+// dim must sit at mode 0.  For an NHWC tensor that means (C, W, H, N) here,
+// with stride (1, C, C*W, C*W*H).  make_tma_atom asserts stride<0> == 1 at
+// runtime; violating this silently produces wrong TMA descriptors.
+//
+// SM90_TMA_LOAD is the CuTe op name for cp.async.bulk.tensor and is the right
+// choice on both Hopper (SM90) and Blackwell (SM100) for single-CTA TMA loads;
+// SM100 only introduces new ops for 2SM multicast, which we do not use here.
+// Element type must be cutlass::half_t (not __half) so CuTe's TMA descriptor
+// machinery dispatches FP16 correctly.
+inline auto make_tma_atom_x(const void* x_ptr, ConvParams const& p) {
+    auto gX = make_tensor(
+        make_gmem_ptr(reinterpret_cast<cutlass::half_t const*>(x_ptr)),
+        make_layout(
+            make_shape (int(p.C), int(p.W), int(p.H), int(p.N)),
+            make_stride(Int<1>{},
+                        int64_t(p.C),
+                        int64_t(p.C) * int64_t(p.W),
+                        int64_t(p.C) * int64_t(p.W) * int64_t(p.H))));
 
-    return cuTensorMapEncodeTiled(
-        &tmap,
-        CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
-        /*tensorRank=*/4,
-        const_cast<void*>(gmem_ptr),
-        size,
-        stride,
-        box,
-        elem_stride,
-        CU_TENSOR_MAP_INTERLEAVE_NONE,
-        // First version uses SWIZZLE_NONE so the smem tile has a linear
-        // (kHaloP, kHaloQ, kBlockC) layout that the compute loop can index
-        // directly.  Swizzle can be revisited as a perf micro-optimization
-        // (see plan.md Step 5).
-        CU_TENSOR_MAP_SWIZZLE_NONE,
-        CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    // CTA tiler over (C, W, H, N); N tile = 1 -> one image per TMA.
+    auto cta_tiler = make_shape(Int<kBlockC>{}, Int<kHaloQ>{},
+                                Int<kHaloP>{}, Int<1>{});
+
+    return make_tma_atom(SM90_TMA_LOAD{}, gX, make_smem_x_layout(), cta_tiler);
 }
 
 } // namespace tma_dwconv
