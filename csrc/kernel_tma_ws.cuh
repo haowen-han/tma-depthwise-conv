@@ -62,12 +62,25 @@ struct SmemLayout {
 };
 
 // ----------------------------- device kernel -------------------------------
-template <class TmaAtomX, int N_STAGE, int WARPS_PER_CTA>
+//
+// Stall-probe mode (kStallProbe == true):
+//   stall_buf layout = [num_blocks][3] of unsigned long long:
+//     [block][0] = producer  cycles spent inside wait_barrier(empty_bar)
+//     [block][1] = consumer  cycles spent inside wait_barrier(full_bar),
+//                  summed across all consumer warps (each warp contributes
+//                  via lane 0)
+//     [block][2] = total kernel cycles measured by warp 0 lane 0
+//                  (clock64 end - clock64 start)
+//   When kStallProbe == false, stall_buf is ignored and the probe code is
+//   compiled out (`if constexpr`).
+template <class TmaAtomX, int N_STAGE, int WARPS_PER_CTA,
+          bool kStallProbe = false>
 __global__ void dwconv_tma_ws_kernel(
     CUTE_GRID_CONSTANT TmaAtomX const tma_atom_x,
     const __half* __restrict__ F,
     __half*       __restrict__ Y,
-    ConvParams    params)
+    ConvParams    params,
+    unsigned long long* stall_buf = nullptr)
 {
     static_assert(WARPS_PER_CTA >= 2, "need 1 producer + >=1 consumer warp");
     constexpr int CONSUMER_WARPS   = WARPS_PER_CTA - 1;
@@ -87,6 +100,18 @@ __global__ void dwconv_tma_ws_kernel(
     const int p_base = p_block * kBlockP;
 
     const int num_q_tiles = (params.Q + kBlockQ - 1) / kBlockQ;
+
+    // ---- Stall-probe accumulators (compiled out when kStallProbe=false) ----
+    uint64_t prod_stall_cycles = 0;
+    uint64_t cons_stall_cycles = 0;
+    uint64_t kernel_start_cyc  = 0;  // producer warp 0 lane 0 only
+    uint64_t cons_start_cyc    = 0;  // each consumer warp lane 0
+    if constexpr (kStallProbe) {
+        if (threadIdx.x == 0) kernel_start_cyc = clock64();
+        // Consumer warps record their own start (lane 0 per warp), so we can
+        // compute their actual lifetime — producer typically retires earlier.
+        if (warp_id != 0 && lane_id == 0) cons_start_cyc = clock64();
+    }
 
     // ---- Barrier initialization (single elected thread) ----
     if (threadIdx.x == 0) {
@@ -137,7 +162,12 @@ __global__ void dwconv_tma_ws_kernel(
 
                 if (round > 0) {
                     const uint32_t empty_phase = (round - 1) & 1u;
+                    uint64_t t0 = 0;
+                    if constexpr (kStallProbe) t0 = clock64();
                     cute::wait_barrier(smem.empty_bar[s_idx], empty_phase);
+                    if constexpr (kStallProbe) {
+                        prod_stall_cycles += clock64() - t0;
+                    }
                 }
 
                 cute::set_barrier_transaction_bytes(
@@ -162,7 +192,14 @@ __global__ void dwconv_tma_ws_kernel(
             const int s_idx = tile % N_STAGE;
             const int round = tile / N_STAGE;
             const uint32_t full_phase = round & 1u;
+            uint64_t t0 = 0;
+            if constexpr (kStallProbe) {
+                if (lane_id == 0) t0 = clock64();
+            }
             cute::wait_barrier(smem.full_bar[s_idx], full_phase);
+            if constexpr (kStallProbe) {
+                if (lane_id == 0) cons_stall_cycles += clock64() - t0;
+            }
 
             const int q_base = tile * kBlockQ;
 
@@ -216,6 +253,31 @@ __global__ void dwconv_tma_ws_kernel(
 
             // Signal this stage's buffer is free.
             cute::arrive_barrier(smem.empty_bar[s_idx]);
+        }
+    }
+
+    // ---- Stall-probe writeback ----
+    if constexpr (kStallProbe) {
+        const int block_lin =
+            (blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
+        // Producer warp lane 0: producer stall + total kernel cycles.
+        if (warp_id == 0 && lane_id == 0) {
+            const uint64_t kernel_end = clock64();
+            atomicAdd(&stall_buf[block_lin * 4 + 0],
+                      static_cast<unsigned long long>(prod_stall_cycles));
+            atomicAdd(&stall_buf[block_lin * 4 + 2],
+                      static_cast<unsigned long long>(
+                          kernel_end - kernel_start_cyc));
+        }
+        // Each consumer warp's lane 0 contributes to the consumer-stall slot
+        // and to the consumer-total slot (its own lifetime).
+        if (warp_id != 0 && lane_id == 0) {
+            const uint64_t cons_end = clock64();
+            atomicAdd(&stall_buf[block_lin * 4 + 1],
+                      static_cast<unsigned long long>(cons_stall_cycles));
+            atomicAdd(&stall_buf[block_lin * 4 + 3],
+                      static_cast<unsigned long long>(
+                          cons_end - cons_start_cyc));
         }
     }
 }
